@@ -1,0 +1,16 @@
+[book]
+authors = ["Teddy Tennant"]
+language = "en"
+src = "src"
+title = "Quorum"
+description = "A Zig-based MoE inference engine for Apple Silicon"
+
+[build]
+build-dir = "book"
+
+[output.html]
+additional-css = ["./theme/catppuccin.css"]
+default-theme = "mocha"
+preferred-dark-theme = "mocha"
+git-repository-url = "https://github.com/teddytennant/quorum"
+edit-url-template = "https://github.com/teddytennant/quorum/edit/main/docs/{path}"
