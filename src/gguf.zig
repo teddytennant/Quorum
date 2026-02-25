@@ -18,6 +18,15 @@ const GGUF_DEFAULT_ALIGNMENT: usize = 32;
 /// Read buffer size
 const READ_BUFFER_SIZE: usize = 8192;
 
+/// Maximum number of metadata key-value pairs (prevents DoS from malformed files)
+const MAX_METADATA_KV_COUNT: u64 = 100_000;
+
+/// Maximum metadata key length in bytes (1 MB)
+const MAX_KEY_LEN: u64 = 1_048_576;
+
+/// Maximum number of tensor dimensions
+const MAX_TENSOR_DIMS: u32 = 4;
+
 /// GGUF metadata value types
 pub const MetaValueType = enum(u32) {
     uint8 = 0,
@@ -153,7 +162,7 @@ pub const GGUFFile = struct {
     mapped_data: ?[]align(std.heap.page_size_min) const u8,
 
     const ReaderError = Io.Reader.Error;
-    const ParseError = ReaderError || Allocator.Error;
+    const ParseError = ReaderError || Allocator.Error || error{InvalidFormat};
 
     pub fn open(allocator: Allocator, path: []const u8) !GGUFFile {
         const file = try fs.cwd().openFile(path, .{});
@@ -255,11 +264,12 @@ pub const GGUFFile = struct {
         try reader.readSliceAll(dest);
     }
 
-    fn skipBytes(reader: *Io.Reader, count: u64) ReaderError!void {
+    fn skipBytes(reader: *Io.Reader, count: u64) (ReaderError || error{InvalidFormat})!void {
         var remaining = count;
         while (remaining > 0) {
             const to_skip = @min(remaining, 4096);
-            _ = try reader.take(@intCast(to_skip));
+            const skip_usize = std.math.cast(usize, to_skip) orelse return error.InvalidFormat;
+            _ = try reader.take(skip_usize);
             remaining -= to_skip;
         }
     }
@@ -285,9 +295,16 @@ pub const GGUFFile = struct {
         const reader = &self.file_reader.interface;
         const arena = self.string_arena.allocator();
 
+        if (self.header.metadata_kv_count > MAX_METADATA_KV_COUNT) {
+            return error.InvalidFormat;
+        }
+
         var i: u64 = 0;
         while (i < self.header.metadata_kv_count) : (i += 1) {
             const key_len = try readU64(reader);
+            if (key_len > MAX_KEY_LEN) {
+                return error.InvalidFormat;
+            }
             const key = try arena.alloc(u8, key_len);
             try readBytes(reader, key);
 
@@ -369,7 +386,8 @@ pub const GGUFFile = struct {
             return;
         }
 
-        self.tensors = try self.allocator.alloc(TensorInfo, self.header.tensor_count);
+        const tensor_count = std.math.cast(usize, self.header.tensor_count) orelse return error.InvalidFormat;
+        self.tensors = try self.allocator.alloc(TensorInfo, tensor_count);
         errdefer self.allocator.free(self.tensors);
 
         for (self.tensors) |*tensor| {
@@ -379,6 +397,9 @@ pub const GGUFFile = struct {
             tensor.name = name;
 
             tensor.n_dims = try readU32(reader);
+            if (tensor.n_dims > MAX_TENSOR_DIMS) {
+                return error.InvalidFormat;
+            }
             tensor.shape = [4]u64{ 1, 1, 1, 1 };
             for (0..tensor.n_dims) |d| {
                 tensor.shape[d] = try readU64(reader);
@@ -390,7 +411,7 @@ pub const GGUFFile = struct {
 
             var n_elements: u64 = 1;
             for (tensor.shape[0..tensor.n_dims]) |dim| {
-                n_elements *= dim;
+                n_elements = std.math.mul(u64, n_elements, dim) catch return error.InvalidFormat;
             }
             const block_size = tensor.dtype.blockSize();
             const block_elements = tensor.dtype.blockElements();
@@ -404,9 +425,10 @@ pub const GGUFFile = struct {
 
     fn mapTensorData(self: *GGUFFile) !void {
         const file_len = try self.file.getEndPos();
+        const mmap_size = std.math.cast(usize, file_len) orelse return error.InvalidFormat;
         const mapped = try posix.mmap(
             null,
-            @intCast(file_len),
+            mmap_size,
             posix.PROT.READ,
             .{ .TYPE = .SHARED },
             self.file.handle,
@@ -428,8 +450,8 @@ pub const GGUFFile = struct {
         if (self.metadata.get(key)) |value| {
             return switch (value) {
                 .uint32 => value.uint32,
-                .uint64 => @intCast(value.uint64),
-                .int32 => @intCast(value.int32),
+                .uint64 => std.math.cast(u32, value.uint64),
+                .int32 => std.math.cast(u32, value.int32),
                 else => null,
             };
         }
@@ -452,7 +474,9 @@ pub const GGUFFile = struct {
         if (end > mapped.len) {
             return null;
         }
-        return mapped[@intCast(start)..@intCast(end)];
+        const start_usize = std.math.cast(usize, start) orelse return null;
+        const end_usize = std.math.cast(usize, end) orelse return null;
+        return mapped[start_usize..end_usize];
     }
 };
 
@@ -476,4 +500,84 @@ test "align up" {
     try std.testing.expectEqual(@as(u64, 32), alignUp(1, 32));
     try std.testing.expectEqual(@as(u64, 32), alignUp(32, 32));
     try std.testing.expectEqual(@as(u64, 64), alignUp(33, 32));
+}
+
+test "align up edge cases" {
+    // Zero value aligns to zero
+    try std.testing.expectEqual(@as(u64, 0), alignUp(0, 32));
+    // Value of 1 aligns up to alignment
+    try std.testing.expectEqual(@as(u64, 32), alignUp(1, 32));
+    // Value just below alignment
+    try std.testing.expectEqual(@as(u64, 32), alignUp(31, 32));
+    // Value exactly at alignment
+    try std.testing.expectEqual(@as(u64, 32), alignUp(32, 32));
+    // Value just above alignment
+    try std.testing.expectEqual(@as(u64, 64), alignUp(33, 32));
+    // Alignment of 1 should return the same value
+    try std.testing.expectEqual(@as(u64, 0), alignUp(0, 1));
+    try std.testing.expectEqual(@as(u64, 1), alignUp(1, 1));
+    try std.testing.expectEqual(@as(u64, 100), alignUp(100, 1));
+    // Different alignment values
+    try std.testing.expectEqual(@as(u64, 64), alignUp(33, 64));
+    try std.testing.expectEqual(@as(u64, 64), alignUp(64, 64));
+    try std.testing.expectEqual(@as(u64, 128), alignUp(65, 64));
+}
+
+test "GGMLType block sizes for common types" {
+    // Unquantized types
+    try std.testing.expectEqual(@as(usize, 4), GGMLType.f32.blockSize());
+    try std.testing.expectEqual(@as(usize, 2), GGMLType.f16.blockSize());
+    try std.testing.expectEqual(@as(usize, 8), GGMLType.f64.blockSize());
+    // Quantized types
+    try std.testing.expectEqual(@as(usize, 18), GGMLType.q4_0.blockSize());
+    try std.testing.expectEqual(@as(usize, 34), GGMLType.q8_0.blockSize());
+    // Integer types
+    try std.testing.expectEqual(@as(usize, 1), GGMLType.i8.blockSize());
+    try std.testing.expectEqual(@as(usize, 2), GGMLType.i16.blockSize());
+    try std.testing.expectEqual(@as(usize, 4), GGMLType.i32.blockSize());
+    try std.testing.expectEqual(@as(usize, 8), GGMLType.i64.blockSize());
+}
+
+test "GGMLType block elements for common types" {
+    // Unquantized types: 1 element per block
+    try std.testing.expectEqual(@as(usize, 1), GGMLType.f32.blockElements());
+    try std.testing.expectEqual(@as(usize, 1), GGMLType.f16.blockElements());
+    try std.testing.expectEqual(@as(usize, 1), GGMLType.f64.blockElements());
+    try std.testing.expectEqual(@as(usize, 1), GGMLType.i8.blockElements());
+    try std.testing.expectEqual(@as(usize, 1), GGMLType.i16.blockElements());
+    try std.testing.expectEqual(@as(usize, 1), GGMLType.i32.blockElements());
+    // Quantized 4/5/8-bit: 32 elements per block
+    try std.testing.expectEqual(@as(usize, 32), GGMLType.q4_0.blockElements());
+    try std.testing.expectEqual(@as(usize, 32), GGMLType.q4_1.blockElements());
+    try std.testing.expectEqual(@as(usize, 32), GGMLType.q5_0.blockElements());
+    try std.testing.expectEqual(@as(usize, 32), GGMLType.q5_1.blockElements());
+    try std.testing.expectEqual(@as(usize, 32), GGMLType.q8_0.blockElements());
+    try std.testing.expectEqual(@as(usize, 32), GGMLType.q8_1.blockElements());
+    // K-quant types: 256 elements per block
+    try std.testing.expectEqual(@as(usize, 256), GGMLType.q2_k.blockElements());
+    try std.testing.expectEqual(@as(usize, 256), GGMLType.q3_k.blockElements());
+    try std.testing.expectEqual(@as(usize, 256), GGMLType.q4_k.blockElements());
+    try std.testing.expectEqual(@as(usize, 256), GGMLType.q5_k.blockElements());
+    try std.testing.expectEqual(@as(usize, 256), GGMLType.q6_k.blockElements());
+    try std.testing.expectEqual(@as(usize, 256), GGMLType.q8_k.blockElements());
+}
+
+test "MAX_TENSOR_DIMS constant matches shape array size" {
+    // Ensure our constant matches the actual shape array size in TensorInfo
+    const info = TensorInfo{
+        .name = "",
+        .n_dims = 0,
+        .shape = [4]u64{ 1, 1, 1, 1 },
+        .dtype = .f32,
+        .offset = 0,
+        .size_bytes = 0,
+    };
+    try std.testing.expectEqual(@as(usize, MAX_TENSOR_DIMS), info.shape.len);
+}
+
+test "metadata limits are reasonable" {
+    try std.testing.expect(MAX_METADATA_KV_COUNT > 0);
+    try std.testing.expect(MAX_METADATA_KV_COUNT <= 100_000);
+    try std.testing.expect(MAX_KEY_LEN > 0);
+    try std.testing.expect(MAX_KEY_LEN <= 1_048_576);
 }

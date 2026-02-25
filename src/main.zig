@@ -160,11 +160,13 @@ fn printTensorExamples(model: *gguf.GGUFFile) void {
                 .data = data,
             };
             const offset = model.dataOffset(info);
+            const elem_count = view.elementCount() catch 0;
+            const storage = view.storageBytes() catch 0;
             std.debug.print("{s}: offset {} bytes, {} elements, {} storage bytes\n", .{
                 name,
                 offset,
-                view.elementCount(),
-                view.storageBytes(),
+                elem_count,
+                storage,
             });
             found_any = true;
         }
@@ -184,4 +186,10 @@ fn printArchMetadata(model: *gguf.GGUFFile, arch: []const u8, suffix: []const u8
 test "basic functionality" {
     // Placeholder test
     try std.testing.expect(true);
+}
+
+test {
+    // Ensure tests from all submodules are discovered
+    std.testing.refAllDeclsRecursive(@import("gguf.zig"));
+    std.testing.refAllDeclsRecursive(@import("tensor.zig"));
 }
