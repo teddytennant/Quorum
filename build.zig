@@ -15,7 +15,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // Link system libraries for Metal (macOS only)
-    if (target.query.os_tag == null or target.query.os_tag == .macos) {
+    const is_macos = if (target.query.os_tag) |tag| tag == .macos else @import("builtin").os.tag == .macos;
+    if (is_macos) {
         exe.linkFramework("Metal");
         exe.linkFramework("Foundation");
         exe.linkFramework("CoreGraphics");
