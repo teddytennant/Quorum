@@ -21,7 +21,7 @@ const READ_BUFFER_SIZE: usize = 8192;
 /// Maximum number of metadata key-value pairs (prevents DoS from malformed files)
 const MAX_METADATA_KV_COUNT: u64 = 100_000;
 
-/// Maximum metadata key length in bytes (1 MB)
+/// Maximum metadata key/string length in bytes (1 MB)
 const MAX_KEY_LEN: u64 = 1_048_576;
 
 /// Maximum number of tensor dimensions
@@ -93,6 +93,14 @@ pub const GGMLType = enum(u32) {
             .q5_k => 176,
             .q6_k => 210,
             .q8_k => 292,
+            .iq2_xxs => 66,
+            .iq2_xs => 74,
+            .iq3_xxs => 98,
+            .iq1_s => 50,
+            .iq4_nl => 34,
+            .iq3_s => 110,
+            .iq2_s => 82,
+            .iq4_xs => 36,
             .i8 => 1,
             .i16 => 2,
             .i32 => 4,
@@ -105,8 +113,8 @@ pub const GGMLType = enum(u32) {
     pub fn blockElements(self: GGMLType) usize {
         return switch (self) {
             .f32, .f16, .bf16, .i8, .i16, .i32, .i64, .f64 => 1,
-            .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q8_1 => 32,
-            .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k => 256,
+            .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q8_1, .iq4_nl, .iq4_xs => 32,
+            .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq3_s, .iq2_s => 256,
             else => 1,
         };
     }
@@ -338,6 +346,7 @@ pub const GGUFFile = struct {
             .bool_ => MetaValue{ .bool_ = (try readU8(reader)) != 0 },
             .string => blk: {
                 const len = try readU64(reader);
+                if (len > MAX_KEY_LEN) return error.InvalidFormat;
                 const str = try arena.alloc(u8, len);
                 try readBytes(reader, str);
                 break :blk MetaValue{ .string = str };

@@ -18,9 +18,9 @@ pub const TensorView = struct {
     pub fn storageBytes(self: TensorView) error{Overflow}!u64 {
         const elements = try self.elementCount();
         const block_elements = self.dtype.blockElements();
-        const block_size = self.dtype.blockSize();
+        const block_size: u64 = @intCast(self.dtype.blockSize());
         const n_blocks = (elements + block_elements - 1) / block_elements;
-        return n_blocks * block_size;
+        return std.math.mul(u64, n_blocks, block_size);
     }
 };
 
