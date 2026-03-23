@@ -162,6 +162,7 @@ pub const GGUFFile = struct {
     header: Header,
     metadata: std.StringHashMap(MetaValue),
     tensors: []TensorInfo,
+    tensor_map: std.StringHashMap(usize),
     tensor_data_offset: u64,
     alignment: usize,
     string_arena: std.heap.ArenaAllocator,
@@ -182,6 +183,7 @@ pub const GGUFFile = struct {
             .header = undefined,
             .metadata = std.StringHashMap(MetaValue).init(allocator),
             .tensors = &[_]TensorInfo{},
+            .tensor_map = std.StringHashMap(usize).init(allocator),
             .tensor_data_offset = 0,
             .alignment = GGUF_DEFAULT_ALIGNMENT,
             .string_arena = std.heap.ArenaAllocator.init(allocator),
@@ -211,6 +213,7 @@ pub const GGUFFile = struct {
         }
         self.file.close();
         self.metadata.deinit();
+        self.tensor_map.deinit();
         if (self.tensors.len > 0) {
             self.allocator.free(self.tensors);
         }
@@ -322,9 +325,17 @@ pub const GGUFFile = struct {
             const value = try readMetaValue(reader, value_type, arena);
 
             if (mem.eql(u8, key, "general.alignment")) {
-                if (value == .uint32) {
-                    self.alignment = value.uint32;
-                }
+                self.alignment = switch (value) {
+                    .uint8 => value.uint8,
+                    .uint16 => value.uint16,
+                    .uint32 => value.uint32,
+                    .uint64 => std.math.cast(usize, value.uint64) orelse return error.InvalidFormat,
+                    .int8 => std.math.cast(usize, value.int8) orelse return error.InvalidFormat,
+                    .int16 => std.math.cast(usize, value.int16) orelse return error.InvalidFormat,
+                    .int32 => std.math.cast(usize, value.int32) orelse return error.InvalidFormat,
+                    .int64 => std.math.cast(usize, value.int64) orelse return error.InvalidFormat,
+                    else => self.alignment,
+                };
             }
 
             try self.metadata.put(key, value);
@@ -355,12 +366,13 @@ pub const GGUFFile = struct {
                 const elem_type_int = try readU32(reader);
                 const elem_type: MetaValueType = @enumFromInt(elem_type_int);
                 const len = try readU64(reader);
+                const len_usize = std.math.cast(usize, len) orelse return error.InvalidFormat;
 
-                var j: u64 = 0;
-                while (j < len) : (j += 1) {
-                    try skipMetaValue(reader, elem_type);
+                const elems = try arena.alloc(MetaValue, len_usize);
+                for (elems) |*elem| {
+                    elem.* = try readMetaValue(reader, elem_type, arena);
                 }
-                break :blk MetaValue{ .array = &[_]MetaValue{} };
+                break :blk MetaValue{ .array = elems };
             },
         };
     }
@@ -428,6 +440,11 @@ pub const GGUFFile = struct {
             tensor.size_bytes = n_blocks * block_size;
         }
 
+        // Build name->index map for O(1) tensor lookup
+        for (self.tensors, 0..) |*tensor, idx| {
+            try self.tensor_map.put(tensor.name, idx);
+        }
+
         const current_pos = try self.file.getPos();
         self.tensor_data_offset = alignUp(current_pos, self.alignment);
     }
@@ -468,12 +485,8 @@ pub const GGUFFile = struct {
     }
 
     pub fn getTensor(self: *GGUFFile, name: []const u8) ?*const TensorInfo {
-        for (self.tensors) |*tensor| {
-            if (mem.eql(u8, tensor.name, name)) {
-                return tensor;
-            }
-        }
-        return null;
+        const idx = self.tensor_map.get(name) orelse return null;
+        return &self.tensors[idx];
     }
 
     pub fn getTensorData(self: *const GGUFFile, tensor: *const TensorInfo) ?[]const u8 {
