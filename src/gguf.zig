@@ -275,16 +275,6 @@ pub const GGUFFile = struct {
         try reader.readSliceAll(dest);
     }
 
-    fn skipBytes(reader: *Io.Reader, count: u64) (ReaderError || error{InvalidFormat})!void {
-        var remaining = count;
-        while (remaining > 0) {
-            const to_skip = @min(remaining, 4096);
-            const skip_usize = std.math.cast(usize, to_skip) orelse return error.InvalidFormat;
-            _ = try reader.take(skip_usize);
-            remaining -= to_skip;
-        }
-    }
-
     fn parseHeader(self: *GGUFFile) !void {
         const reader = &self.file_reader.interface;
 
@@ -325,7 +315,7 @@ pub const GGUFFile = struct {
             const value = try readMetaValue(reader, value_type, arena);
 
             if (mem.eql(u8, key, "general.alignment")) {
-                self.alignment = switch (value) {
+                const raw_align: usize = switch (value) {
                     .uint8 => value.uint8,
                     .uint16 => value.uint16,
                     .uint32 => value.uint32,
@@ -336,6 +326,11 @@ pub const GGUFFile = struct {
                     .int64 => std.math.cast(usize, value.int64) orelse return error.InvalidFormat,
                     else => self.alignment,
                 };
+                // Alignment must be a power of two and non-zero (alignUp uses bitmask arithmetic)
+                if (raw_align == 0 or (raw_align & (raw_align - 1)) != 0) {
+                    return error.InvalidFormat;
+                }
+                self.alignment = raw_align;
             }
 
             try self.metadata.put(key, value);
@@ -375,28 +370,6 @@ pub const GGUFFile = struct {
                 break :blk MetaValue{ .array = elems };
             },
         };
-    }
-
-    fn skipMetaValue(reader: *Io.Reader, value_type: MetaValueType) ParseError!void {
-        switch (value_type) {
-            .uint8, .int8, .bool_ => _ = try readU8(reader),
-            .uint16, .int16 => _ = try readU16(reader),
-            .uint32, .int32, .float32 => _ = try readU32(reader),
-            .uint64, .int64, .float64 => _ = try readU64(reader),
-            .string => {
-                const len = try readU64(reader);
-                try skipBytes(reader, len);
-            },
-            .array => {
-                const elem_type_int = try readU32(reader);
-                const elem_type: MetaValueType = @enumFromInt(elem_type_int);
-                const len = try readU64(reader);
-                var j: u64 = 0;
-                while (j < len) : (j += 1) {
-                    try skipMetaValue(reader, elem_type);
-                }
-            },
-        }
     }
 
     fn parseTensors(self: *GGUFFile) !void {
